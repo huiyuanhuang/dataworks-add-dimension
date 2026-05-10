@@ -1,0 +1,55 @@
+# This patch shows the key changes needed to parallelize analyze()
+# Apply these changes to routers/analysis.py
+
+# 1. Add to imports:
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import asyncio
+
+# 2. Add a helper function for async DDL check:
+async def _check_all_upstream_columns(upstreams, dimension_name, default_project):
+    """Run all upstream DDL checks in parallel using ThreadPoolExecutor."""
+    loop = asyncio.get_event_loop()
+    tasks = []
+    
+    for t in upstreams:
+        table_name = t.get("table_name", "")
+        if not table_name:
+            continue
+        coro = loop.run_in_executor(
+            None, check_column_in_table,
+            table_name, dimension_name, default_project
+        )
+        tasks.append((t, coro))
+    
+    results = await asyncio.gather(*[c for _, c in tasks], return_exceptions=True)
+    
+    for (t, _), result in zip(tasks, results):
+        table_name = t.get("table_name", "")
+        if isinstance(result, Exception):
+            t["field_exists"] = False
+            t["ddl_verified"] = False
+            yield t, {"exists": False, "error": str(result)}
+        else:
+            t["field_exists"] = result["exists"]
+            t["ddl_verified"] = True
+            yield t, result
+
+# 3. In the analyze() function, replace the sequential loop with:
+    tasks = []
+    
+    # Task 1: Downstream nodes
+    async def _find_downstream_async():
+        try:
+            return find_downstream_nodes(
+                req.project_id, req.table_name,
+                sql_content=sql_content,
+                node_id=task_data.get("node_id"),
+            )
+        except Exception as e:
+            logger.warning(f"Failed to find downstream nodes: {e}")
+            return []
+    
+    tasks.append(_find_downstream_async())
+    
+    # Task 2-4: Process upstream tables in parallel
+    # (use the async generator above)

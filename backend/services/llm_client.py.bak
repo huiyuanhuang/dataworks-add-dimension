@@ -1,0 +1,670 @@
+"""OpenAI API client for SQL analysis, rewriting, and self-checking.
+
+Optimizations applied:
+- Tool Use: structured output via JSON mode (eliminates JSON parse failures)
+- Model Tiering: gpt-5.4 for all tasks
+- Streaming: reduce perceived latency
+- Result Caching: in-memory cache to avoid duplicate LLM calls
+"""
+
+import json
+import logging
+import os
+import re
+import time
+import hashlib
+from typing import Optional
+
+try:
+    import openai
+except ImportError:
+    openai = None
+
+logger = logging.getLogger("llm_client")
+
+# ── Environment config ──────────────────────────────────────────
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", os.environ.get("ANTHROPIC_AUTH_TOKEN", ""))
+OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", os.environ.get("ANTHROPIC_BASE_URL", ""))
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.4")
+OPENAI_TIMEOUT = int(os.environ.get("OPENAI_TIMEOUT", os.environ.get("ANTHROPIC_TIMEOUT", "60")))
+OPENAI_MAX_RETRIES = int(os.environ.get("OPENAI_MAX_RETRIES", os.environ.get("ANTHROPIC_MAX_RETRIES", "3")))
+
+# ── Prompt constants ────────────────────────────────────────────
+
+ANALYZE_SYSTEM_PROMPT = """You are an ODPS (MaxCompute) SQL analyst. You analyze SQL scripts \
+to determine how they expand dimensions for reporting dashboards. ODPS SQL uses Alibaba Cloud \
+MaxCompute dialect (similar to Hive SQL).
+
+When given a SQL script and a new dimension name, you must:
+1. Identify the expansion type: "cube" (GROUP BY CUBE), "lateral_view" (LATERAL VIEW EXPLODE), \
+"group_by" (plain GROUP BY without CUBE or EXPLODE), or "unknown" if none found.
+2. Parse all upstream source tables (tables referenced in FROM/JOIN clauses, \
+excluding the INSERT OVERWRITE target table).
+3. For each upstream table, determine how the dimension field relates to the current SQL output.
+4. Identify any issues that would prevent adding the dimension.
+
+Use the sql_analysis tool to report your findings."""
+
+ANALYZE_USER_TEMPLATE = """Analyze this ODPS SQL for adding the dimension "{dimension_name}" \
+(Chinese name: "{dimension_chinese_name}").
+
+SQL:
+```sql
+{original_sql}
+```"""
+
+REWRITE_SYSTEM_PROMPT = """You are an ODPS (MaxCompute) SQL rewriting expert. You modify SQL \
+scripts to add new dimension columns for reporting dashboards. ODPS SQL uses Alibaba Cloud \
+MaxCompute dialect (similar to Hive SQL).
+
+CRITICAL RULES for dimension addition:
+
+1. For CUBE expansion (GROUP BY CUBE):
+   - Add IF(grouping({dim}) = 0,{dim},'ALL') AS {dim} to the INNER SELECT that contains the \
+GROUP BY CUBE clause, as the LAST item in the SELECT column list (after all existing \
+columns including aggregate expressions like SUM/COUNT, immediately before FROM).
+   - Add the plain column reference {dim} (NOT nvl/coalesce) to the OUTERmost SELECT, \
+as the LAST item in the SELECT column list (after all existing columns including \
+aggregate expressions). The ALL values are already produced by IF(grouping()) in \
+the inner query, so the outer SELECT just references the column directly.
+   - Add {dim} to the GROUP BY CUBE(...) dimension list inside the parentheses.
+   - Add {dim} to the OUTER GROUP BY clause (the one WITHOUT CUBE, which aggregates \
+the CUBE subquery results).
+   - Add {dim} to the INSERT OVERWRITE TABLE column list (if explicit columns are listed).
+   - Add {dim} STRING COMMENT '{chinese_name}' to the CREATE TABLE column definition \
+(if present), as the last column before the closing parenthesis.
+   - Insert ALTER TABLE ADD COLUMNS statement after CREATE TABLE closing, wrapped in \
+-- CODEX:BEGIN_MANAGED_ALTER and -- CODEX:END_MANAGED_ALTER markers.
+
+2. For LATERAL VIEW EXPLODE expansion:
+   - Add a new LATERAL VIEW EXPLODE(array({dim}, 'ALL')) line after the existing \
+LATERAL VIEW EXPLODE line, with a derived alias table and group column.
+   - Add the group column to the SELECT list as the LAST item (after all existing columns).
+   - Add {dim} to INSERT OVERWRITE TABLE column list and CREATE TABLE definition.
+   - Generate ALTER TABLE ADD COLUMNS statement with CODEX markers.
+
+3. For plain GROUP BY expansion:
+   - Add {dim} AS {dim} to the SELECT list as the LAST item (after all existing columns, \
+including aggregate expressions like SUM/COUNT, immediately before FROM).
+   - Add {dim} to the GROUP BY clause.
+   - Add {dim} to INSERT OVERWRITE TABLE column list and CREATE TABLE definition.
+   - Generate ALTER TABLE ADD COLUMNS statement with CODEX markers.
+
+4. ALWAYS:
+   - Preserve ALL existing SQL structure, comments, and formatting exactly as-is.
+   - Only ADD new elements, never DELETE or REORDER existing ones.
+   - The new dimension column MUST be the LAST column in every clause where it is added:
+     SELECT column list, INSERT OVERWRITE TABLE column list, CREATE TABLE column \
+definition, and GROUP BY dimension list. NEVER place the new dimension column in the \
+middle of a SELECT list (e.g. between existing dimension columns and aggregate columns). \
+It MUST always come AFTER all existing columns, including aggregate expressions like \
+SUM/COUNT/AVG. This is the single most important positional rule.
+   - Use the dimension Chinese name as COMMENT value where applicable.
+   - For ALTER TABLE, use the format: \
+ALTER TABLE <target_table> ADD COLUMNS ({dim} STRING COMMENT '{chinese_name}');
+   - Wrap the ALTER TABLE in -- CODEX:BEGIN_MANAGED_ALTER and -- CODEX:END_MANAGED_ALTER.
+
+Use the sql_rewrite tool to report the modified SQL and changes."""
+
+REWRITE_USER_TEMPLATE = """Rewrite this ODPS SQL to add dimension "{dimension_name}" \
+(Chinese name: "{dimension_chinese_name}").
+The expansion type is: {expansion_type}.
+
+Original SQL:
+```sql
+{original_sql}
+```
+
+Apply all the dimension addition rules for the {expansion_type} expansion type."""
+
+SELF_CHECK_SYSTEM_PROMPT = """You are an ODPS SQL quality checker. You verify that dimension \
+additions to SQL scripts are correct and complete.
+
+Given the original SQL, modified SQL, dimension name, expansion type, and ALTER TABLE SQL, \
+check each of the following criteria:
+
+1. column_position: Is the new dimension the LAST column in the INSERT OVERWRITE TABLE \
+column list? If there is no explicit column list, check if the dimension appears in the \
+outer SELECT as the last non-aggregate column.
+2. all_logic:
+   - For CUBE: does the modified SQL contain IF(grouping({dim})...) in the inner subquery?
+   - For lateral_view: does it contain EXPLODE(array({dim}, 'ALL'))?
+   - For group_by: always passes (no ALL logic needed).
+3. dimension_in_select: Is {dim} present in the outermost SELECT clause?
+4. dimension_in_groupby: Is {dim} present in GROUP BY or GROUP BY CUBE?
+5. dimension_in_outer_groupby: (CUBE only) Is {dim} in the outer GROUP BY \
+(the one without CUBE)?
+6. alter_table: Is the ALTER TABLE ADD COLUMNS statement (provided separately) \
+present and correct?
+7. managed_blocks: Always passes — CODEX markers are stripped from the modified SQL \
+and the ALTER TABLE is handled separately via the alter_table_sql field.
+
+Use the sql_self_check tool to report the check results."""
+
+SELF_CHECK_USER_TEMPLATE = """Self-check this SQL modification.
+
+Original SQL:
+```sql
+{original_sql}
+```
+
+Modified SQL:
+```sql
+{modified_sql}
+```
+
+Dimension: {dimension_name}
+Expansion type: {expansion_type}
+ALTER TABLE SQL: {alter_sql}
+
+Verify all criteria."""
+
+
+# ── Tool schemas for structured output ───────────────────────────
+
+ANALYZE_TOOL = {
+    "name": "sql_analysis",
+    "description": "Report SQL analysis results including expansion type, upstream tables, and issues.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "expansion_type": {
+                "type": "string",
+                "enum": ["cube", "lateral_view", "group_by", "unknown"],
+                "description": "How the outermost aggregation handles multi-dimension reporting",
+            },
+            "upstream_tables": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "table_name": {"type": "string"},
+                        "alias": {"type": "string"},
+                        "field_exists": {"type": "boolean"},
+                        "via_select_star": {"type": "boolean"},
+                        "suggested_source": {"type": "boolean"},
+                    },
+                    "required": ["table_name"],
+                },
+            },
+            "issues": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+        },
+        "required": ["expansion_type", "upstream_tables", "issues"],
+    },
+}
+
+REWRITE_TOOL = {
+    "name": "sql_rewrite",
+    "description": "Report the modified SQL, ALTER TABLE statement, and changes made.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "modified_sql": {
+                "type": "string",
+                "description": "The complete modified SQL as a single string with \\n for line breaks.",
+            },
+            "alter_table_sql": {
+                "type": "string",
+                "description": "The ALTER TABLE ADD COLUMNS statement wrapped in CODEX markers.",
+            },
+            "changes_made": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Description of each change made.",
+            },
+            "issues": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Any issues encountered, or empty array.",
+            },
+        },
+        "required": ["modified_sql", "alter_table_sql", "changes_made", "issues"],
+    },
+}
+
+SELF_CHECK_TOOL = {
+    "name": "sql_self_check",
+    "description": "Report self-check results for the SQL modification.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "checks": {
+                "type": "object",
+                "properties": {
+                    "column_position": {
+                        "type": "object",
+                        "properties": {
+                            "pass": {"type": "boolean"},
+                            "message": {"type": "string"},
+                        },
+                    },
+                    "all_logic": {
+                        "type": "object",
+                        "properties": {
+                            "pass": {"type": "boolean"},
+                            "message": {"type": "string"},
+                        },
+                    },
+                    "dimension_in_select": {
+                        "type": "object",
+                        "properties": {
+                            "pass": {"type": "boolean"},
+                            "message": {"type": "string"},
+                        },
+                    },
+                    "dimension_in_groupby": {
+                        "type": "object",
+                        "properties": {
+                            "pass": {"type": "boolean"},
+                            "message": {"type": "string"},
+                        },
+                    },
+                    "dimension_in_outer_groupby": {
+                        "type": "object",
+                        "properties": {
+                            "pass": {"type": "boolean"},
+                            "message": {"type": "string"},
+                        },
+                    },
+                    "alter_table": {
+                        "type": "object",
+                        "properties": {
+                            "pass": {"type": "boolean"},
+                            "message": {"type": "string"},
+                        },
+                    },
+                    "managed_blocks": {
+                        "type": "object",
+                        "properties": {
+                            "pass": {"type": "boolean"},
+                            "message": {"type": "string"},
+                        },
+                    },
+                },
+            },
+            "all_pass": {"type": "boolean"},
+        },
+        "required": ["checks", "all_pass"],
+    },
+}
+
+
+def _parse_json_response(text: str) -> dict:
+    """Extract JSON dict from a text response (fallback when tool_use is not used)."""
+    # Try to find a JSON object in the text
+    match = re.search(r'\{[^{}]*\}', text, re.DOTALL)
+    if not match:
+        # Try nested braces — find the outermost { ... }
+        start = text.find('{')
+        end = text.rfind('}')
+        if start != -1 and end != -1 and end > start:
+            match_str = text[start:end + 1]
+        else:
+            raise ValueError(f"No JSON object found in response")
+    else:
+        match_str = match.group(0)
+
+    try:
+        obj = json.loads(match_str)
+        if isinstance(obj, dict):
+            return obj
+        raise ValueError(f"Expected JSON dict, got {type(obj).__name__}")
+    except json.JSONDecodeError as e:
+        raise ValueError(f"JSON parse error: {e}")
+
+
+def _normalize_result(result) -> dict:
+    """Normalize LLM tool_use result to a dict.
+
+    The API proxy may return block.input as a JSON string instead of a dict.
+    """
+    if isinstance(result, dict):
+        return result
+    if isinstance(result, str):
+        try:
+            parsed = json.loads(result)
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+        return _parse_json_response(result)
+    raise ValueError(f"Unexpected result type: {type(result).__name__}")
+
+
+# ── Result cache ────────────────────────────────────────────────
+
+_cache: dict = {}
+
+
+def _cache_key(sql: str, dimension_name: str, dimension_chinese_name: str,
+               expansion_type: str = "") -> str:
+    return hashlib.sha256(
+        f"{sql}|{dimension_name}|{dimension_chinese_name}|{expansion_type}".encode()
+    ).hexdigest()
+
+
+def _extract_target_table(sql: str) -> str:
+    """Extract target table name from INSERT OVERWRITE or CREATE TABLE."""
+    m = re.search(r'INSERT\s+OVERWRITE\s+TABLE\s+(\S+)', sql, re.IGNORECASE)
+    if m:
+        return m.group(1).strip('`')
+    m = re.search(r'CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(\S+)', sql, re.IGNORECASE)
+    if m:
+        return m.group(1).strip('`')
+    return "???"
+
+
+# ── LLMClient ────────────────────────────────────────────────────
+
+class LLMClient:
+    def __init__(self, api_key: str, base_url: str = "",
+                 analyze_model: str = ANTHROPIC_ANALYZE_MODEL,
+                 rewrite_model: str = ANTHROPIC_REWRITE_MODEL,
+                 check_model: str = ANTHROPIC_CHECK_MODEL,
+                 max_retries: int = ANTHROPIC_MAX_RETRIES,
+                 timeout: int = ANTHROPIC_TIMEOUT):
+        client_kwargs = {"api_key": api_key}
+        if base_url:
+            client_kwargs["base_url"] = base_url
+        self.client = anthropic.Anthropic(**client_kwargs)
+        self.analyze_model = analyze_model
+        self.rewrite_model = rewrite_model
+        self.check_model = check_model
+        self.max_retries = max_retries
+        self.timeout = timeout
+
+    def _call_claude(self, system_prompt: str, user_message: str,
+                     model: str = None, tool: dict = None,
+                     use_thinking: bool = False,
+                     thinking_budget: int = 4000,
+                     use_streaming: bool = False) -> dict:
+        """Call Claude API with retry, prompt caching, tool use, thinking, and streaming.
+
+        Args:
+            system_prompt: System prompt text
+            user_message: User message text
+            model: Model to use (defaults to rewrite_model)
+            tool: Tool schema for structured output (Tool Use)
+            use_thinking: Enable extended thinking for complex tasks
+            thinking_budget: Token budget for thinking
+            use_streaming: Use streaming mode for lower perceived latency
+        """
+        model = model or self.rewrite_model
+
+        # Build system param with prompt caching
+        system_param = [
+            {
+                "type": "text",
+                "text": system_prompt,
+                "cache_control": {"type": "ephemeral"},
+            }
+        ]
+
+        # Build message create kwargs
+        create_kwargs = {
+            "model": model,
+            "max_tokens": 16000 if use_thinking else 8192,
+            "system": system_param,
+            "messages": [{"role": "user", "content": user_message}],
+        }
+
+        # Tool Use — use tool_choice=auto because the API provider
+        # (Alibaba Cloud proxy) runs in thinking mode by default,
+        # which rejects tool_choice "required" or "object" types.
+        if tool:
+            create_kwargs["tools"] = [tool]
+            create_kwargs["tool_choice"] = {"type": "auto"}
+
+        # Extended Thinking
+        if use_thinking:
+            create_kwargs["thinking"] = {
+                "type": "enabled",
+                "budget_tokens": thinking_budget,
+            }
+
+        for attempt in range(self.max_retries):
+            try:
+                if use_streaming:
+                    # Streaming mode — collect text progressively
+                    collected_text = ""
+                    with self.client.messages.stream(**create_kwargs) as stream:
+                        for text in stream.text_stream:
+                            collected_text += text
+                    # If using tool_use, streaming returns tool_use blocks
+                    # Need to get the final message to extract tool_use
+                    final_message = stream.get_final_message()
+                    if tool:
+                        result = next(
+                            (block.input for block in final_message.content
+                             if block.type == "tool_use"),
+                            None,
+                        )
+                        if result is None:
+                            # Model chose text instead of tool (happens with tool_choice=auto + thinking)
+                            logger.warning("No tool_use block in streaming response, falling back to text parse")
+                            return _parse_json_response(collected_text)
+                        return result
+                    return _parse_json_response(collected_text)
+
+                else:
+                    # Non-streaming mode
+                    response = self.client.messages.create(**create_kwargs)
+
+                    if tool:
+                        # Extract structured output from tool_use block
+                        result = next(
+                            (block.input for block in response.content
+                             if block.type == "tool_use"),
+                            None,
+                        )
+                        if result is None:
+                            # Model chose text instead of tool (happens with tool_choice=auto + thinking)
+                            logger.warning("No tool_use block in response, falling back to text parse")
+                            raw_text = next(
+                                (block.text for block in response.content if block.type == "text"),
+                                None,
+                            )
+                            if raw_text is None:
+                                raise ValueError("No text block in response")
+                            return _parse_json_response(raw_text)
+                        return result
+                    else:
+                        # Text response — parse JSON
+                        raw_text = next(
+                            (block.text for block in response.content if block.type == "text"),
+                            None,
+                        )
+                        if raw_text is None:
+                            raise ValueError("No text block in response")
+                        return _parse_json_response(raw_text)
+
+            except anthropic.RateLimitError:
+                wait = 2 ** (attempt + 1)
+                logger.warning(f"Rate limited, retrying in {wait}s (attempt {attempt+1})")
+                time.sleep(wait)
+            except anthropic.APIStatusError as e:
+                if e.status_code in (400, 401, 403):
+                    raise
+                wait = 2 ** (attempt + 1)
+                logger.warning(f"API error {e.status_code}, retrying in {wait}s")
+                time.sleep(wait)
+            except (anthropic.APIConnectionError, TimeoutError):
+                wait = 2 ** (attempt + 1)
+                logger.warning(f"Connection error, retrying in {wait}s")
+                time.sleep(wait)
+            except ValueError as e:
+                # JSON parse failure or missing tool_use block
+                if attempt < self.max_retries - 1:
+                    logger.warning(f"Parse/tool error: {e}, retrying (attempt {attempt+1})")
+                    time.sleep(1)
+                    continue
+                raise
+
+        raise RuntimeError(f"LLM call failed after {self.max_retries} retries")
+
+    # ── Public methods ────────────────────────────────────────────
+
+    def analyze_sql(self, sql: str, dimension_name: str,
+                    dimension_chinese_name: str = "") -> dict:
+        """Analyze SQL for expansion type, upstream tables, and issues.
+        Uses haiku model with Tool Use for structured output.
+        Results are cached to avoid duplicate calls.
+        """
+        # Check cache first
+        key = _cache_key(sql, dimension_name, dimension_chinese_name)
+        if key in _cache:
+            logger.info("Returning cached analyze result")
+            return _cache[key]
+
+        user_msg = ANALYZE_USER_TEMPLATE.format(
+            dimension_name=dimension_name,
+            dimension_chinese_name=dimension_chinese_name,
+            original_sql=sql,
+        )
+        result = self._call_claude(
+            ANALYZE_SYSTEM_PROMPT, user_msg,
+            model=self.analyze_model,
+            tool=ANALYZE_TOOL,
+            use_streaming=True,
+        )
+
+        # Normalize result (proxy may return string instead of dict)
+        result = _normalize_result(result)
+
+        # Validate and normalize
+        valid_types = {"cube", "lateral_view", "group_by", "unknown"}
+        if result.get("expansion_type") not in valid_types:
+            result["expansion_type"] = "unknown"
+        result.setdefault("upstream_tables", [])
+        result.setdefault("issues", [])
+
+        # Normalize upstream table entries (LLM may return strings instead of objects)
+        normalized_tables = []
+        for t in result["upstream_tables"]:
+            if isinstance(t, str):
+                normalized_tables.append({"table_name": t})
+            elif isinstance(t, dict):
+                normalized_tables.append(t)
+            else:
+                logger.warning(f"Skipping unexpected upstream_table entry type: {type(t).__name__}")
+        result["upstream_tables"] = normalized_tables
+
+        for t in result["upstream_tables"]:
+            t.setdefault("alias", "")
+            t.setdefault("field_exists", False)
+            t.setdefault("via_select_star", False)
+            t.setdefault("ddl_verified", False)
+            t.setdefault("suggested_source", False)
+
+        # Cache result
+        _cache[key] = result
+        return result
+
+    def rewrite_sql(self, sql: str, dimension_name: str,
+                    dimension_chinese_name: str = "",
+                    expansion_type: str = "group_by",
+                    use_thinking: bool = False) -> dict:
+        """Rewrite SQL to add dimension.
+        Uses sonnet model with Tool Use + Prompt Caching.
+        Extended Thinking optional for complex SQL.
+        """
+        user_msg = REWRITE_USER_TEMPLATE.format(
+            dimension_name=dimension_name,
+            dimension_chinese_name=dimension_chinese_name,
+            expansion_type=expansion_type,
+            original_sql=sql,
+        )
+        result = self._call_claude(
+            REWRITE_SYSTEM_PROMPT, user_msg,
+            model=self.rewrite_model,
+            tool=REWRITE_TOOL,
+            use_streaming=True,
+            use_thinking=use_thinking,
+        )
+
+        # Normalize result (proxy may return string instead of dict)
+        result = _normalize_result(result)
+
+        # Validate
+        if not result.get("modified_sql"):
+            raise ValueError("LLM rewrite returned empty modified_sql")
+
+        comment_part = f" COMMENT '{dimension_chinese_name}'" if dimension_chinese_name else ''
+        result.setdefault("alter_table_sql",
+                          f"ALTER TABLE {_extract_target_table(sql)} "
+                          f"ADD COLUMNS ({dimension_name} STRING"
+                          f"{comment_part});")
+        result.setdefault("changes_made", [])
+        result.setdefault("issues", [])
+
+        return result
+
+    def self_check(self, original_sql: str, modified_sql: str,
+                   dimension_name: str, expansion_type: str,
+                   alter_sql: str) -> dict:
+        """Self-check the modified SQL for correctness.
+        Uses haiku model with Tool Use.
+        """
+        user_msg = SELF_CHECK_USER_TEMPLATE.format(
+            original_sql=original_sql,
+            modified_sql=modified_sql,
+            dimension_name=dimension_name,
+            expansion_type=expansion_type,
+            alter_sql=alter_sql,
+        )
+        result = self._call_claude(
+            SELF_CHECK_SYSTEM_PROMPT, user_msg,
+            model=self.check_model,
+            tool=SELF_CHECK_TOOL,
+            use_streaming=True,
+        )
+
+        # Normalize result (proxy may return string instead of dict)
+        result = _normalize_result(result)
+
+        checks = result.get("checks", {})
+        checks["all_pass"] = all(
+            c.get("pass", True) for c in checks.values() if isinstance(c, dict)
+        )
+        return checks
+
+
+# ── Singleton ────────────────────────────────────────────────────
+
+_llm_client: Optional[LLMClient] = None
+
+
+def _get_llm_client() -> LLMClient:
+    global _llm_client
+    if _llm_client is None:
+        if not ANTHROPIC_AUTH_TOKEN:
+            raise RuntimeError("Missing environment variable: ANTHROPIC_AUTH_TOKEN")
+        _llm_client = LLMClient(ANTHROPIC_AUTH_TOKEN, ANTHROPIC_BASE_URL)
+    return _llm_client
+
+
+# ── Convenience wrappers ────────────────────────────────────────
+
+def llm_analyze(sql: str, dimension_name: str, dimension_chinese_name: str = "") -> dict:
+    return _get_llm_client().analyze_sql(sql, dimension_name, dimension_chinese_name)
+
+
+def llm_rewrite(sql: str, dimension_name: str, dimension_chinese_name: str = "",
+                expansion_type: str = "group_by",
+                use_thinking: bool = False) -> dict:
+    return _get_llm_client().rewrite_sql(sql, dimension_name, dimension_chinese_name,
+                                          expansion_type, use_thinking)
+
+
+def llm_self_check(original_sql: str, modified_sql: str, dimension_name: str,
+                   expansion_type: str, alter_sql: str) -> dict:
+    return _get_llm_client().self_check(original_sql, modified_sql, dimension_name,
+                                          expansion_type, alter_sql)
+
+
+def llm_clear_cache():
+    """Clear the result cache."""
+    _cache.clear()

@@ -1,0 +1,427 @@
+from fastapi import APIRouter
+from pydantic import BaseModel
+from typing import List, Optional
+import asyncio
+import difflib
+import logging
+import re
+
+from services.dataworks_client import query_task, commit_node, _get_project_id, find_downstream_nodes
+from services.llm_client import llm_analyze, llm_rewrite, llm_self_check
+from services.odps_client import check_column_in_table
+
+logger = logging.getLogger("analysis")
+router = APIRouter()
+
+
+# ── CODEX ALTER block stripper ─────────────────────────────────────
+
+def strip_codex_alter_block(sql: str) -> str:
+    """Remove CODEX-managed ALTER block from SQL.
+
+    The ALTER TABLE statement wrapped in -- CODEX:BEGIN_MANAGED_ALTER /
+    -- CODEX:END_MANAGED_ALTER markers should NOT appear in the SQL that
+    gets saved to DataWorks or displayed in the diff. It should only be
+    available via the separate alter_table_sql field for execution.
+    """
+    pattern = (
+        r'\s*--\s*CODEX:BEGIN_MANAGED_ALTER\s*\n'
+        r'.*?\n'
+        r'\s*--\s*CODEX:END_MANAGED_ALTER[^\n]*\n?'
+    )
+    return re.sub(pattern, '', sql, flags=re.DOTALL)
+
+
+# ── Analyze ──────────────────────────────────────────────────
+
+class AnalyzeRequest(BaseModel):
+    project_id: str
+    table_name: str
+    dimension_name: str
+    dimension_chinese_name: Optional[str] = ""
+
+class UpstreamTable(BaseModel):
+    table_name: str
+    field_exists: bool
+    via_select_star: bool = False
+    ddl_verified: bool = False
+    suggested_source: bool = False
+    alias: Optional[str] = ""
+
+class DownstreamNode(BaseModel):
+    node_id: str
+    node_name: str
+    project_env: str = "DEV"
+    needs_filter: bool = False
+
+class AnalyzeResponse(BaseModel):
+    original_sql: str
+    upstream_tables: List[UpstreamTable]
+    downstream_nodes: List[DownstreamNode]
+    expansion_type: str
+    issues: List[str] = []
+    error: Optional[str] = None
+    file_id: Optional[int] = None
+    node_id: Optional[str] = None
+
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+
+# Shared thread pool for ODPS DDL calls (max 10 concurrent)
+_ddl_executor = ThreadPoolExecutor(max_workers=10)
+
+
+def _check_upstream(table_name: str, dimension_name: str, default_project: str):
+    """Wrapper for check_column_in_table that also returns the table name."""
+    result = check_column_in_table(table_name, dimension_name, default_project=default_project)
+    return table_name, result
+
+
+@router.post("/analyze", response_model=AnalyzeResponse)
+async def analyze(req: AnalyzeRequest):
+    import time as _time
+    _t0 = _time.time()
+    logger.info(f"[analyze] START project={req.project_id} table={req.table_name} dim={req.dimension_name}")
+
+    task_data = query_task(req.project_id, req.table_name)
+
+    if not task_data.get("found"):
+        logger.warning(f"[analyze] query_task FAILED: {task_data.get('error')}")
+        error_msg = task_data.get("error", "未知错误")
+        return AnalyzeResponse(
+            original_sql=f"-- Error: {error_msg}",
+            upstream_tables=[],
+            downstream_nodes=[],
+            expansion_type="unknown",
+            issues=[error_msg],
+            error=error_msg,
+        )
+
+    sql_content = task_data["code"]
+    logger.info(f"[analyze] query_task OK file_id={task_data.get('file_id')} node_id={task_data.get('node_id')} sql_len={len(sql_content)}")
+
+    try:
+        logger.info(f"[analyze] LLM analyze START dim={req.dimension_name}")
+        result = llm_analyze(sql_content, req.dimension_name, req.dimension_chinese_name)
+        expansion = result["expansion_type"]
+        upstreams = result["upstream_tables"]
+        issues = result["issues"]
+        error_msg = None
+        logger.info(f"[analyze] LLM analyze OK expansion={expansion} upstreams={len(upstreams)} issues={len(issues)}")
+    except Exception as e:
+        logger.warning(f"LLM analyze failed: {e}")
+        expansion = "unknown"
+        upstreams = []
+        issues = [f"LLM 分析失败: {str(e)}"]
+        error_msg = str(e)
+
+    # ── Parallel execution: DDL checks + downstream nodes ──
+    loop = asyncio.get_event_loop()
+
+    async def _check_all_upstream():
+        valid = [t for t in upstreams if t.get("table_name")]
+        logger.info(f"[analyze] upstream DDL check START tables={len(valid)}")
+        if not valid:
+            logger.info("[analyze] no upstream tables to check")
+            return
+        futures = [
+            loop.run_in_executor(
+                None, check_column_in_table,
+                t["table_name"], req.dimension_name, req.project_id,
+            )
+            for t in valid
+        ]
+        results = await asyncio.gather(*futures, return_exceptions=True)
+        for t, res in zip(valid, results):
+            table_name = t["table_name"]
+            if isinstance(res, Exception):
+                t["field_exists"] = False
+                t["ddl_verified"] = False
+                continue
+            t["field_exists"] = res["exists"]
+            t["ddl_verified"] = True
+            if res["exists"]:
+                logger.info(f"DDL verified: column '{req.dimension_name}' exists in '{table_name}'")
+            elif res.get("error"):
+                logger.warning(f"DDL check failed for '{table_name}': {res['error']}")
+                if f"无法验证上游表 '{table_name}' 的字段 '{req.dimension_name}'" not in issues:
+                    issues.append(f"上游表 '{table_name}' DDL验证失败: {res.get('error', '')}")
+            else:
+                issue_msg = f"上游表 '{table_name}' 中不存在维度字段 '{req.dimension_name}'，需要在上游表添加该字段"
+                if issue_msg not in issues:
+                    issues.append(issue_msg)
+
+    async def _find_downstream():
+        logger.info("[analyze] downstream find START")
+        try:
+            return find_downstream_nodes(
+                req.project_id, req.table_name,
+                sql_content=sql_content, node_id=task_data.get("node_id"),
+            )
+        except Exception as e:
+            logger.warning(f"[analyze] downstream find FAILED: {e}")
+            return []
+
+    upstream_task = asyncio.create_task(_check_all_upstream())
+    downstream_task = asyncio.create_task(_find_downstream())
+
+    await upstream_task
+    downstreams = await downstream_task
+    elapsed = _time.time() - _t0
+    logger.info(f"[analyze] END elapsed={elapsed:.2f}s upstreams={len(upstreams)} downstreams={len(downstreams)} issues={len(issues)}")
+
+    return AnalyzeResponse(
+        original_sql=sql_content,
+        upstream_tables=[UpstreamTable(**u) for u in upstreams],
+        downstream_nodes=[DownstreamNode(**d) for d in downstreams],
+        expansion_type=expansion,
+        issues=issues,
+        error=error_msg,
+        file_id=task_data.get("file_id"),
+        node_id=task_data.get("node_id"),
+    )
+# ── Diff computation ──────────────────────────────────────────
+
+def compute_diff(original: str, modified: str) -> list:
+    orig_lines = original.splitlines(keepends=True)
+    mod_lines = modified.splitlines(keepends=True)
+
+    diff = difflib.SequenceMatcher(None, orig_lines, mod_lines)
+    result = []
+
+    for op, i1, i2, j1, j2 in diff.get_opcodes():
+        if op == 'equal':
+            for k in range(i1, i2):
+                result.append({
+                    "orig_line_num": k + 1,
+                    "mod_line_num": j1 + 1 + (k - i1),
+                    "content": orig_lines[k].rstrip('\n'),
+                    "type": "unchanged"
+                })
+        elif op == 'replace':
+            for k in range(i1, i2):
+                result.append({
+                    "orig_line_num": k + 1,
+                    "mod_line_num": None,
+                    "content": orig_lines[k].rstrip('\n'),
+                    "type": "removed"
+                })
+            for k in range(j1, j2):
+                result.append({
+                    "orig_line_num": None,
+                    "mod_line_num": k + 1,
+                    "content": mod_lines[k].rstrip('\n'),
+                    "type": "added"
+                })
+        elif op == 'delete':
+            for k in range(i1, i2):
+                result.append({
+                    "orig_line_num": k + 1,
+                    "mod_line_num": None,
+                    "content": orig_lines[k].rstrip('\n'),
+                    "type": "removed"
+                })
+        elif op == 'insert':
+            for k in range(j1, j2):
+                result.append({
+                    "orig_line_num": None,
+                    "mod_line_num": k + 1,
+                    "content": mod_lines[k].rstrip('\n'),
+                    "type": "added"
+                })
+
+    return result
+
+
+# ── Modify ────────────────────────────────────────────────────
+
+class ModifyRequest(BaseModel):
+    project_id: str
+    table_name: str
+    dimension_name: str
+    dimension_chinese_name: Optional[str] = ""
+    expansion_type: Optional[str] = "unknown"
+    file_id: Optional[int] = None
+    node_id: Optional[str] = None
+    upstream_source: Optional[str] = None
+    selected_downstreams: List[str] = []
+
+class DiffLine(BaseModel):
+    orig_line_num: Optional[int] = None
+    mod_line_num: Optional[int] = None
+    content: str
+    type: str
+
+class ModifyResponse(BaseModel):
+    original_sql: str
+    modified_sql: str
+    diff_lines: List[DiffLine]
+    alter_table_sql: str
+    file_id: Optional[int] = None
+    node_id: Optional[str] = None
+    saved_to_dataworks: bool = False
+    self_check: Optional[dict] = None
+    error: Optional[str] = None
+
+
+async def _async_self_check(original_sql, modified_sql, dimension_name, expansion_type, alter_sql):
+    """Run self_check in a thread pool to avoid blocking."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        None, llm_self_check,
+        original_sql, modified_sql, dimension_name, expansion_type, alter_sql,
+    )
+
+
+async def _async_commit_node(project_id_int, file_id, modified_sql, commit_message):
+    """Run commit_node in a thread pool."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        None, commit_node,
+        project_id_int, file_id, modified_sql, commit_message,
+    )
+
+
+@router.post("/modify", response_model=ModifyResponse)
+async def modify(req: ModifyRequest):
+    # 1. Get original SQL
+    loop = asyncio.get_event_loop()
+    task_data = await loop.run_in_executor(None, query_task, req.project_id, req.table_name)
+
+    if not task_data.get("found"):
+        error_msg = task_data.get("error", "未知错误")
+        return ModifyResponse(
+            original_sql="",
+            modified_sql="",
+            diff_lines=[],
+            alter_table_sql="",
+            error=error_msg,
+        )
+
+    original_sql = task_data["code"]
+    file_id = req.file_id or task_data.get("file_id")
+    node_id = req.node_id or task_data.get("node_id")
+
+    # 2. Determine expansion type
+    # P0: Trust frontend-provided expansion_type, skip re-analyze
+    expansion_type = req.expansion_type
+    # Only re-analyze if truly unknown or not provided
+    if not expansion_type or expansion_type == "unknown":
+        try:
+            analyze_result = await loop.run_in_executor(
+                None, llm_analyze, original_sql, req.dimension_name, req.dimension_chinese_name,
+            )
+            expansion_type = analyze_result["expansion_type"]
+        except Exception as e:
+            logger.warning(f"LLM expansion type detection failed: {e}")
+            expansion_type = "group_by"
+
+    # 3. Rewrite SQL via LLM
+    # Enable extended thinking for complex expansion types (cube, lateral_view)
+    use_thinking = expansion_type in ("cube", "lateral_view")
+    try:
+        rewrite_result = await loop.run_in_executor(
+            None, llm_rewrite,
+            original_sql, req.dimension_name, req.dimension_chinese_name, expansion_type,
+            use_thinking,
+        )
+        modified_sql = rewrite_result["modified_sql"]
+        alter_sql = rewrite_result["alter_table_sql"]
+        rewrite_issues = rewrite_result.get("issues", [])
+
+        # Strip CODEX-managed ALTER block from modified_sql
+        modified_sql = strip_codex_alter_block(modified_sql)
+
+        modified_sql = restore_chinese_comments(original_sql, modified_sql)
+
+    except Exception as e:
+        logger.error(f"LLM rewrite failed: {e}")
+        return ModifyResponse(
+            original_sql=original_sql,
+            modified_sql=original_sql,
+            diff_lines=[],
+            alter_table_sql="",
+            file_id=file_id,
+            node_id=node_id,
+            error=f"LLM SQL改写失败: {str(e)}",
+        )
+
+    # 4. Compute diff
+    diff_lines_data = compute_diff(original_sql, modified_sql)
+
+    # 5. Save to DataWorks + 6. Self-check — PARALLEL (P2 optimization)
+    project_id_int = _get_project_id(req.project_id)
+
+    # Prepare async tasks
+    tasks = []
+
+    # Task A: Self-check
+    self_check_coro = _async_self_check(
+        original_sql, modified_sql, req.dimension_name, expansion_type, alter_sql,
+    )
+    tasks.append(self_check_coro)
+
+    # Task B: Save to DataWorks (only if file_id and project_id available)
+    save_result = {"success": False, "error": None}
+    if file_id and project_id_int:
+        commit_message = f"自动加维度: {req.dimension_name} ({req.dimension_chinese_name})"
+        save_coro = _async_commit_node(project_id_int, file_id, modified_sql, commit_message)
+        tasks.append(save_coro)
+    else:
+        if not project_id_int:
+            save_result["error"] = f"无法获取项目 '{req.project_id}' 的 DataWorks project_id"
+        # No save task — add a dummy coroutine that returns immediately
+        async def _noop():
+            return save_result
+        tasks.append(_noop())
+
+    # Run tasks in parallel
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    self_check = results[0] if not isinstance(results[0], Exception) else {
+        "all_pass": False, "error": f"LLM自检失败: {str(results[0])}"
+    }
+
+    if len(results) > 1:
+        commit_result = results[1] if not isinstance(results[1], Exception) else {
+            "success": False, "error": str(results[1])
+        }
+        if isinstance(commit_result, dict):
+            save_result = commit_result
+
+    saved = save_result.get("success", False)
+    save_error = save_result.get("error")
+
+    # 7. Re-pull SQL if saved
+    if saved:
+        re_task = await loop.run_in_executor(None, query_task, req.project_id, req.table_name)
+        if re_task.get("found"):
+            re_pulled_sql = re_task["code"]
+            diff_lines_data = compute_diff(original_sql, re_pulled_sql)
+            modified_sql = re_pulled_sql
+
+    # 8. Build response
+    all_issues = rewrite_issues
+    if save_error:
+        all_issues.append(f"保存到 DataWorks 失败: {save_error}")
+
+    error_msg = None
+    if all_issues:
+        error_msg = "; ".join(all_issues)
+
+    return ModifyResponse(
+        original_sql=original_sql,
+        modified_sql=modified_sql,
+        diff_lines=[DiffLine(**d) for d in diff_lines_data],
+        alter_table_sql=alter_sql,
+        file_id=file_id,
+        node_id=node_id,
+        saved_to_dataworks=saved,
+        self_check=self_check,
+        error=error_msg,
+    )
+
+
+# ── SQL Formatting preservation ───────────────────────────────
+
+

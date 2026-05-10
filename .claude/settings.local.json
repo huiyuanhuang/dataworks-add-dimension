@@ -1,0 +1,34 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm run:*)",
+      "Bash(rm -rf node_modules package-lock.json)",
+      "Bash(npm install:*)",
+      "Bash(lsof -ti:8080)",
+      "Bash(xargs kill:*)",
+      "Bash(/opt/anaconda3/bin/python3 -m uvicorn main:app --port 8080)",
+      "Bash(curl -s http://localhost:8080/api/health)",
+      "Bash(curl -s -X POST http://localhost:8080/api/analysis/modify -H 'Content-Type: application/json' -d '{\"project_id\":\"nemo_spock_sg_project\",\"table_name\":\"dwr_spock_test2_1d\",\"dimension_name\":\"sub\",\"dimension_chinese_name\":\"实验状态\",\"expansion_type\":\"cube\"}')",
+      "Bash(kill -9 5599 20652 40888)",
+      "Bash(find /Users/huanghuiyuan/myproject/dataworks-add-dimension/backend -name '__pycache__' -type d -exec rm -rf {} +)",
+      "Bash(disown)",
+      "Bash(/opt/anaconda3/bin/python3:*)",
+      "Bash(bash /Users/huanghuiyuan/myproject/dataworks-add-dimension/start.sh)",
+      "Bash(curl -s http://localhost:8080/docs)",
+      "Bash(env)",
+      "Bash(curl -s http://localhost:8080/api/projects/list)",
+      "Bash(lsof:*)",
+      "Bash(mdfind \"flat-knowledge-builder\")",
+      "Bash(python -c \"from services.dataworks_client import list_projects, query_task, commit_node, _get_project_id, resolve_project_id, DataWorksClientWrapper, QPSLimiter; print\\('All imports OK'\\)\")",
+      "Bash(python:*)",
+      "Bash(python3:*)",
+      "Bash(/opt/anaconda3/bin/pip install:*)",
+      "Bash(curl:*)",
+      "Bash(pip show:*)",
+      "Bash(find /Users/huanghuiyuan/myproject/dataworks-add-dimension/backend -type f -name \"*.py\" -exec ls -lt {} +)",
+      "Bash(find:*)",
+      "Bash(wc:*)",
+      "Bash(git -C /Users/huanghuiyuan/myproject/dataworks-add-dimension status)"
+    ]
+  }
+}
