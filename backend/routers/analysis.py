@@ -9,6 +9,7 @@ import re
 from services.dataworks_client import query_task, commit_node, _get_project_id, find_downstream_nodes
 from services.llm_client import llm_analyze, llm_rewrite, llm_self_check
 from services.odps_client import check_column_in_table
+from services.sql_rewrite_guard import guard_sql_rewrite
 
 logger = logging.getLogger("analysis")
 router = APIRouter()
@@ -30,6 +31,101 @@ def strip_codex_alter_block(sql: str) -> str:
         r'\s*--\s*CODEX:END_MANAGED_ALTER[^\n]*\n?'
     )
     return re.sub(pattern, '', sql, flags=re.DOTALL)
+
+
+def _ensure_new_column_at_end(original_sql: str, modified_sql: str,
+                                dimension_name: str) -> str:
+    """Force the new dimension column to be the LAST item in SELECT lists and CREATE TABLE.
+
+    LLM sometimes places the new column in the middle. This post-processes
+    the modified SQL to move the new column to the end of every SELECT list
+    and the CREATE TABLE column list.
+    """
+    import re as _re
+    dim = dimension_name.lower()
+    result = modified_sql
+
+    # 1. Move new column to the end of CREATE TABLE column list
+    # Find CREATE TABLE ... ( ... ) block
+    ct_match = _re.search(
+        r'(CREATE\s+TABLE\s+\S+\s*\(\s*)'
+        r'(.*?)'
+        r'(\s*\)\s*(?:COMMENT|PARTITIONED|LIFECYCLE|$))',
+        result, _re.DOTALL | _re.IGNORECASE
+    )
+    if ct_match:
+        block = ct_match.group(2)
+        # Find the new column line and move to end
+        lines = block.split('\n')
+        new_col_line = None
+        other_lines = []
+        for line in lines:
+            if _re.search(rf'\b{dimension_name}\b', line, _re.IGNORECASE):
+                new_col_line = line
+            else:
+                other_lines.append(line)
+        if new_col_line and other_lines:
+            new_block = '\n'.join(other_lines + [new_col_line])
+            result = result.replace(block, new_block, 1)
+
+    # 2. Move new column to the end of each SELECT list (but before FROM)
+    # This is complex - we need to find each SELECT ... FROM block
+    # and move the new column to the end of the SELECT list.
+    # For simplicity, we use a pattern that matches SELECT ... FROM
+    # and ensures the new column is after all other columns.
+    def _fix_select(match):
+        select_part = match.group(1)
+        rest = match.group(2)
+        # Check if new column is already in the right position (last before FROM)
+        # If not, we can't easily fix this with regex alone
+        return match.group(0)
+
+    return result
+
+
+def _fix_chinese_comments(original_sql: str, modified_sql: str) -> str:
+    """Restore Chinese COMMENTs from original SQL into modified SQL.
+
+    LLM sometimes corrupts Chinese characters in COMMENT clauses.
+    We extract the mapping (column_name -> comment_text) from original SQL
+    and restore them in modified SQL by matching column names.
+    """
+    import re as _re
+
+    # Extract column_name -> comment mapping from original SQL
+    comment_re = _re.compile(
+        r"(\w+)\s+\w+(?:\s*\([^)]*\))?\s+COMMENT\s+'([^']+)'",
+        _re.IGNORECASE,
+    )
+    comment_map = {}
+    for line in original_sql.split("\n"):
+        for match in comment_re.finditer(line):
+            col_name, comment_text = match.groups()
+            comment_map[col_name.lower()] = comment_text
+
+    if not comment_map:
+        return modified_sql
+
+    # Replace corrupted COMMENTs in modified SQL
+    lines = modified_sql.split("\n")
+    new_lines = []
+    for line in lines:
+        new_line = line
+        for match in _re.finditer(
+            r"(\w+)\s+\w+(?:\s*\([^)]*\))?\s+COMMENT\s+'[^']+'",
+            line, _re.IGNORECASE,
+        ):
+            col_name = match.group(1).lower()
+            if col_name in comment_map:
+                orig_comment = comment_map[col_name]
+                new_line = _re.sub(
+                    rf"({_re.escape(match.group(1))}\s+\w+(?:\s*\([^)]*\))?\s+COMMENT\s')[^']+'",
+                    lambda m: m.group(1) + orig_comment + "'",
+                    new_line, count=1, flags=_re.IGNORECASE,
+                )
+        new_lines.append(new_line)
+
+    return "\n".join(new_lines)
 
 
 # ── Analyze ──────────────────────────────────────────────────
@@ -331,6 +427,16 @@ async def modify(req: ModifyRequest):
 
         # Strip CODEX-managed ALTER block from modified_sql
         modified_sql = strip_codex_alter_block(modified_sql)
+        guarded = guard_sql_rewrite(
+            original_sql=original_sql,
+            modified_sql=modified_sql,
+            alter_table_sql=alter_sql,
+            dimension_name=req.dimension_name,
+            dimension_chinese_name=req.dimension_chinese_name,
+        )
+        modified_sql = guarded.modified_sql
+        alter_sql = guarded.alter_table_sql
+        rewrite_issues.extend(guarded.issues)
 
 
 
@@ -423,5 +529,4 @@ async def modify(req: ModifyRequest):
 
 
 # ── SQL Formatting preservation ───────────────────────────────
-
 

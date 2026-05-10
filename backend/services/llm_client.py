@@ -136,6 +136,19 @@ CRITICAL RULES for dimension addition:
    - Add the dimension to the GROUP BY list.
    - Add the dimension to the SELECT column list.
 
+3. For plain GROUP BY expansion:
+   - Add {dim} AS {dim} to the SELECT column list as the LAST item (after all existing columns, including aggregate expressions, before FROM).
+   - Add {dim} to the GROUP BY clause as the LAST item.
+   - Add {dim} to the INSERT OVERWRITE TABLE column list if explicit columns are listed, as the LAST item.
+   - Add {dim} STRING COMMENT '{chinese_name}' to the CREATE TABLE column definition as the LAST column.
+
+BEFORE returning the modified_sql, VERIFY:
+a) The new dimension column is the LAST item in EVERY SELECT list (inner AND outer)
+b) The new dimension column is the LAST column in the CREATE TABLE definition
+c) ALL existing Chinese COMMENTs are copied EXACTLY as-is from the original SQL
+d) The new column's COMMENT uses the EXACT Chinese name provided: {chinese_name}
+e) Do not invent, translate, encode, or repair Chinese COMMENT text yourself. The backend will enforce final COMMENT values after your rewrite.
+
 Return a JSON object with:
 - modified_sql: string (the complete rewritten SQL)
 - alter_table_sql: string (ALTER TABLE ... ADD COLUMNS statement)
@@ -372,8 +385,12 @@ class LLMClient:
             expansion_type=expansion_type,
             original_sql=sql,
         )
+        system_prompt = REWRITE_SYSTEM_PROMPT.format(
+            dim=dimension_name,
+            chinese_name=dimension_chinese_name,
+        )
         result = self._call_openai(
-            REWRITE_SYSTEM_PROMPT, user_msg,
+            system_prompt, user_msg,
             model=self.rewrite_model,
             use_thinking=use_thinking,
         )
