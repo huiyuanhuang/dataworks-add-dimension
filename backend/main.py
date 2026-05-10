@@ -1,7 +1,14 @@
+import os
+from pathlib import Path
+
+# 从项目根目录加载 .env 文件
+dotenv_path = Path(__file__).parent.parent / ".env"
+from dotenv import load_dotenv  # type: ignore
+load_dotenv(dotenv_path=str(dotenv_path))
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from pathlib import Path
 from routers import projects, analysis, execution, downstream
 
 app = FastAPI(title="DataWorks Add Dimension API", version="1.0.0")
