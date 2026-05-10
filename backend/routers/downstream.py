@@ -26,6 +26,7 @@ class ModifyDownstreamFilterRequest(BaseModel):
     project_id: str
     node_id: str
     dimension_name: str
+    expansion_type: Optional[str] = None
 
 
 class ModifyDownstreamFilterResponse(BaseModel):
@@ -38,7 +39,17 @@ class ModifyDownstreamFilterResponse(BaseModel):
 
 @router.post("/modify-downstream-filter", response_model=ModifyDownstreamFilterResponse)
 def modify_downstream_filter(req: ModifyDownstreamFilterRequest):
-    """Add a WHERE filter to downstream SQL to exclude ALL dimension rows."""
+    """Add a WHERE filter to downstream SQL to exclude ALL dimension rows.
+    
+    Only applicable for cube/lateral_view expansion types that produce 'ALL' rows.
+    """
+    # Only cube/lateral_view produce 'ALL' rows that need downstream filtering
+    if req.expansion_type not in ("cube", "lateral_view"):
+        return ModifyDownstreamFilterResponse(
+            success=False,
+            message=f"无需补充下游过滤：expansion_type='{req.expansion_type}' 不是 cube/lateral_view",
+        )
+
     try:
         # Step 1: Get the downstream node's SQL via node_id
         task_data = _query_task_by_node_id(req.project_id, req.node_id)
@@ -166,8 +177,8 @@ def _add_where_filter(sql: str, dimension_name: str) -> str:
     if where_match:
         where_start = where_match.end()
         remaining = sql[where_start:]
-        # Find end of WHERE clause
-        end_match = re.search(r"\b(GROUP\s+BY|ORDER\s+BY|LIMIT|HAVING|UNION)\b", remaining, re.IGNORECASE)
+        # Find end of WHERE clause (stop before GROUP BY, ORDER BY, LIMIT, HAVING, UNION, or ;)
+        end_match = re.search(r"\b(GROUP\s+BY|ORDER\s+BY|LIMIT|HAVING|UNION)\b|;", remaining, re.IGNORECASE)
         if end_match:
             insert_pos = where_start + end_match.start()
             return sql[:insert_pos].rstrip() + f"\nAND     {dimension_name} = 'ALL'" + sql[insert_pos:]
@@ -181,7 +192,7 @@ def _add_where_filter(sql: str, dimension_name: str) -> str:
         last_from = from_matches[-1]
         from_end = last_from.end()
         remaining = sql[from_end:]
-        next_kw = re.search(r"\b(WHERE|GROUP\s+BY|ORDER\s+BY|LIMIT|HAVING|UNION)\b", remaining, re.IGNORECASE)
+        next_kw = re.search(r"\b(WHERE|GROUP\s+BY|ORDER\s+BY|LIMIT|HAVING|UNION)\b|;", remaining, re.IGNORECASE)
         if next_kw:
             insert_pos = from_end + next_kw.start()
             return sql[:insert_pos].rstrip() + f"\nWHERE   {dimension_name} = 'ALL'" + sql[insert_pos:]

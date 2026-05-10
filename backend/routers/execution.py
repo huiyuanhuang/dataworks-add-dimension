@@ -95,6 +95,7 @@ class BackfillRequest(BaseModel):
     dimension_name: str
     start_dt: str
     end_dt: Optional[str] = None
+    expansion_type: Optional[str] = "unknown"
 
 class BackfillResponse(BaseModel):
     sql: str
@@ -149,13 +150,16 @@ def generate_backfill(req: BackfillRequest):
     other_cols = [c for c in columns if c.lower() != 'dt']
     dt_present = any(c.lower() == 'dt' for c in columns)
 
+    # Only cube/lateral_view produce 'ALL' rows; group_by/unknown use original values
+    needs_all = req.expansion_type in ("cube", "lateral_view")
+
     select_columns = []
     for col in other_cols:
-        select_columns.append(f"  {col}")
-
-    # Add the new dimension column (if not already present) before dt
-    if req.dimension_name not in columns:
-        select_columns.append(f"  'ALL' AS {req.dimension_name}")
+        if col == req.dimension_name and needs_all:
+            # 回刷时新维度列应填充 'ALL'（仅 cube/lateral_view 场景）
+            select_columns.append(f"  'ALL' AS {col}")
+        else:
+            select_columns.append(f"  {col}")
 
     # dt must be the last column for dynamic partition to work
     if dt_present:

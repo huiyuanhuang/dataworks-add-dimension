@@ -46,15 +46,15 @@
           <pre class="sql-block">{{ alterTableSql }}</pre>
         </div>
 
-        <!-- Backfill -->
-        <div class="option-item" @click="checklist.backfill = !checklist.backfill">
+        <!-- Backfill (only for cube/lateral_view which produce 'ALL' rows) -->
+        <div v-if="showBackfill" class="option-item" @click="checklist.backfill = !checklist.backfill">
           <el-checkbox v-model="checklist.backfill" @click.stop />
           <div class="option-info">
             <div class="option-title">历史数据回刷</div>
-            <div class="option-desc">回填历史分区的数据</div>
+            <div class="option-desc">回填历史分区的数据（将新维度填充为 'ALL'）</div>
           </div>
         </div>
-        <div v-if="checklist.backfill" class="backfill-detail" @click.stop>
+        <div v-if="checklist.backfill && showBackfill" class="backfill-detail" @click.stop>
           <div class="backfill-controls">
             <el-date-picker
               v-model="backfillRange"
@@ -216,6 +216,11 @@ const showDownstream = computed(() => {
   return downstreamNodes.value.length > 0 && ['cube', 'lateral_view'].includes(expansion)
 })
 
+const showBackfill = computed(() => {
+  const expansion = props.analysis?.expansion_type
+  return ['cube', 'lateral_view'].includes(expansion)
+})
+
 const summaryItems = computed(() => [
   { label: '项目', value: props.config.projectId, icon: Grid, status: 'info' },
   { label: '目标表', value: props.config.tableName, icon: Document, status: 'info' },
@@ -243,6 +248,7 @@ async function previewBackfill() {
       dimension_name: props.config.dimensionName,
       start_dt: backfillRange.value[0],
       end_dt: backfillRange.value[1],
+      expansion_type: props.analysis?.expansion_type,
     })
     backfillSql.value = res.sql
     backfillPartitions.value = res.estimated_partitions
@@ -265,6 +271,7 @@ async function addDownstreamFilter(node) {
       project_id: props.config.projectId,
       node_id: node.node_id,
       dimension_name: props.config.dimensionName,
+      expansion_type: props.analysis?.expansion_type,
     })
     if (res.success) {
       downstreamDiffData.value = {
@@ -374,6 +381,7 @@ async function execute() {
             dimension_name: props.config.dimensionName,
             start_dt: backfillRange.value[0],
             end_dt: backfillRange.value[1],
+            expansion_type: props.analysis?.expansion_type,
           })
           backfillSql.value = genRes.sql
           backfillPartitions.value = genRes.estimated_partitions
